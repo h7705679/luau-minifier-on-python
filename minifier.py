@@ -478,22 +478,29 @@ def check_token_equivalence(original_src, minified_src, normalize=True):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Roblox Luau minifier.",
+        description="Roblox Luau minifier (in-place by default).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python minifier.py script.lua\n"
-            "  python minifier.py script.lua -o min.lua\n"
-            "  python minifier.py script.lua --check\n"
+            "  python minifier.py script.lua                  # overwrite script.lua in place\n"
+            "  python minifier.py script.lua -o min.lua       # write to a different file\n"
+            "  python minifier.py a.lua b.lua c.lua           # minify multiple files in place\n"
+            "  python minifier.py script.lua --check          # also verify with luau-compile\n"
             "  python minifier.py script.lua --check --luau /path/to/luau-compile\n"
+            "  python minifier.py script.lua -p               # print to stdout, do not touch file\n"
         ),
     )
-    parser.add_argument("input", help="path to .lua/.luau file")
-    parser.add_argument("-o", "--output", help="output file (default: stdout)")
+    parser.add_argument("input", nargs="+", help="one or more .lua/.luau files (minified in place)")
+    parser.add_argument("-o", "--output", help="write to this file instead of overwriting the input (single input only)")
+    parser.add_argument(
+        "-p", "--print",
+        action="store_true",
+        help="print minified output to stdout instead of writing any file",
+    )
     parser.add_argument(
         "--check",
         action="store_true",
-        help="verify output with luau-compile + token equivalence",
+        help="verify each output with luau-compile + token equivalence",
     )
     parser.add_argument(
         "--luau",
@@ -507,67 +514,86 @@ def main():
     )
     args = parser.parse_args()
 
-    src_path = Path(args.input)
-    if not src_path.is_file():
-        print(f"error: file not found — {args.input}", file=sys.stderr)
+    if args.output and len(args.input) > 1:
+        print("error: -o/--output can only be used with a single input file", file=sys.stderr)
         sys.exit(2)
 
-    src = src_path.read_text(encoding="utf-8")
+    if args.print and args.output:
+        print("error: -p/--print and -o/--output are mutually exclusive", file=sys.stderr)
+        sys.exit(2)
 
-    try:
-        minified = minify(src)
-    except Exception as e:
-        print(f"error during minify: {e}", file=sys.stderr)
-        sys.exit(1)
+    overall_ok = True
 
-    if args.output:
-        Path(args.output).write_text(minified, encoding="utf-8")
-    else:
-        sys.stdout.write(minified)
+    for input_path in args.input:
+        src_path = Path(input_path)
+        if not src_path.is_file():
+            print(f"error: file not found — {input_path}", file=sys.stderr)
+            overall_ok = False
+            continue
 
-    if args.check:
-        ok = True
+        src = src_path.read_text(encoding="utf-8")
 
-        if not args.no_token_check:
-            equiv, msg = check_token_equivalence(src, minified)
-            if equiv:
-                print("[OK] token equivalence", file=sys.stderr)
-            else:
-                ok = False
-                print(f"[FAIL] token equivalence broken:\n{msg}", file=sys.stderr)
-
-        if args.luau:
-            import subprocess
-            import tempfile
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".lua", delete=False, encoding="utf-8"
-            ) as tmp:
-                tmp.write(minified)
-                tmp_path = tmp.name
-            try:
-                proc = subprocess.run(
-                    [args.luau, "--only-parse", tmp_path],
-                    capture_output=True, text=True,
-                )
-                if proc.returncode == 0:
-                    print("[OK] luau-compile: syntax ok", file=sys.stderr)
-                else:
-                    ok = False
-                    print(f"[FAIL] luau-compile error:\n{proc.stderr.strip()}",
-                          file=sys.stderr)
-            finally:
-                Path(tmp_path).unlink(missing_ok=True)
-        else:
-            print("[WARN] luau-compile not found — skipping syntax check. "
-                  "Pass --luau /path/to/luau-compile", file=sys.stderr)
+        try:
+            minified = minify(src)
+        except Exception as e:
+            print(f"error minifying {input_path}: {e}", file=sys.stderr)
+            overall_ok = False
+            continue
 
         orig_size = len(src.encode("utf-8"))
         mini_size = len(minified.encode("utf-8"))
         ratio = (mini_size / orig_size * 100) if orig_size else 0
-        print(f"[STAT] size: {orig_size} -> {mini_size} bytes ({ratio:.1f}%)",
-              file=sys.stderr)
 
-        sys.exit(0 if ok else 1)
+        if args.print:
+            sys.stdout.write(minified)
+        elif args.output:
+            Path(args.output).write_text(minified, encoding="utf-8")
+            print(f"[OK] {input_path} -> {args.output}  {orig_size} -> {mini_size} bytes ({ratio:.1f}%)",
+                  file=sys.stderr)
+        else:
+            Path(input_path).write_text(minified, encoding="utf-8")
+            print(f"[OK] {input_path}  {orig_size} -> {mini_size} bytes ({ratio:.1f}%)",
+                  file=sys.stderr)
+
+        if args.check:
+            ok = True
+
+            if not args.no_token_check:
+                equiv, msg = check_token_equivalence(src, minified)
+                if equiv:
+                    print(f"  [OK] token equivalence", file=sys.stderr)
+                else:
+                    ok = False
+                    overall_ok = False
+                    print(f"  [FAIL] token equivalence broken:\n{msg}", file=sys.stderr)
+
+            if args.luau:
+                import subprocess
+                import tempfile
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".lua", delete=False, encoding="utf-8"
+                ) as tmp:
+                    tmp.write(minified)
+                    tmp_path = tmp.name
+                try:
+                    proc = subprocess.run(
+                        [args.luau, "--only-parse", tmp_path],
+                        capture_output=True, text=True,
+                    )
+                    if proc.returncode == 0:
+                        print(f"  [OK] luau-compile: syntax ok", file=sys.stderr)
+                    else:
+                        ok = False
+                        overall_ok = False
+                        print(f"  [FAIL] luau-compile error:\n{proc.stderr.strip()}",
+                              file=sys.stderr)
+                finally:
+                    Path(tmp_path).unlink(missing_ok=True)
+            else:
+                print("[WARN] luau-compile not found — skipping syntax check. "
+                      "Pass --luau /path/to/luau-compile", file=sys.stderr)
+
+    sys.exit(0 if overall_ok else 1)
 
 
 def _detect_luau_compile():
